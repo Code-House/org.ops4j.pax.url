@@ -34,16 +34,9 @@ import java.net.ConnectException;
 import java.net.MalformedURLException;
 import java.net.NoRouteToHostException;
 import java.net.SocketTimeoutException;
+import java.net.URL;
 import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentMap;
@@ -73,6 +66,7 @@ import org.eclipse.aether.connector.basic.BasicRepositoryConnectorFactory;
 import org.eclipse.aether.impl.DefaultServiceLocator;
 import org.eclipse.aether.installation.InstallRequest;
 import org.eclipse.aether.internal.impl.PaxLocalRepositoryManager;
+import org.eclipse.aether.internal.impl.SimpleLocalRepositoryManagerFactory;
 import org.eclipse.aether.internal.impl.slf4j.Slf4jLoggerFactory;
 import org.eclipse.aether.metadata.DefaultMetadata;
 import org.eclipse.aether.metadata.Metadata;
@@ -1141,35 +1135,63 @@ public class AetherBasedResolver implements MavenResolver {
         // default timeout (both connection and read timeouts)
         int defaultTimeout = m_config.getTimeout();
         // connection timeout
-        int connectionTimeout = m_config.getProperty( ServiceConstants.PROPERTY_SOCKET_CONNECTION_TIMEOUT, defaultTimeout, Integer.class );
+        int connectionTimeout = m_config.getProperty(ServiceConstants.PROPERTY_SOCKET_CONNECTION_TIMEOUT, defaultTimeout, Integer.class);
         // read timeout
-        int soTimeout = m_config.getProperty( ServiceConstants.PROPERTY_SOCKET_SO_TIMEOUT, defaultTimeout, Integer.class );
-        locator.setServices( WagonProvider.class, new ManualWagonProvider( m_client, soTimeout, connectionTimeout ) );
-        locator.addService( TransporterFactory.class, WagonTransporterFactory.class );
+        int soTimeout = m_config.getProperty(ServiceConstants.PROPERTY_SOCKET_SO_TIMEOUT, defaultTimeout, Integer.class);
+        locator.setServices(WagonProvider.class, new ManualWagonProvider(m_client, soTimeout, connectionTimeout));
+        locator.addService(TransporterFactory.class, WagonTransporterFactory.class);
         locator.addService(RepositoryConnectorFactory.class, BasicRepositoryConnectorFactory.class);
 
         decrypter = new ConfigurableSettingsDecrypter();
         PaxUrlSecDispatcher secDispatcher = new PaxUrlSecDispatcher();
-        try
-        {
-            secDispatcher.setCipher( new DefaultPlexusCipher() );
+        try {
+            secDispatcher.setCipher(new DefaultPlexusCipher());
+        } catch( PlexusCipherException exc) {
+            throw new IllegalStateException(exc);
         }
-        catch( PlexusCipherException exc )
-        {
-            throw new IllegalStateException( exc );
+        secDispatcher.setConfigurationFile(m_config.getSecuritySettings());
+        decrypter.setSecurityDispatcher(secDispatcher);
+
+        locator.setServices(SettingsDecrypter.class, decrypter);
+
+        locator.setService(LocalRepositoryManagerFactory.class, SimpleLocalRepositoryManagerFactory.class);
+        locator.setService(org.eclipse.aether.spi.log.LoggerFactory.class, Slf4jLoggerFactory.class);
+
+        try {
+            ClassLoader classLoader = AetherBasedResolver.class.getClassLoader();
+            Enumeration<URL> customServices = classLoader.getResources("/META-INF/services/pax-url-services");
+            while (customServices != null && customServices.hasMoreElements()) {
+                Properties customProperties = new Properties();
+                customProperties.load(customServices.nextElement().openStream());
+
+                for (String key : customProperties.stringPropertyNames()) { // service names
+                    Class serviceType = load(classLoader, key);
+                    if (serviceType == null) {
+                        continue;
+                    }
+
+                    List implementations = new ArrayList();
+                    // load service implementations from META-INF/services/<pax-url-services-key>
+                    for (Object implementation : ServiceLoader.load(serviceType, classLoader)) {
+                        implementations.add(implementation);
+                    }
+                    locator.setServices(serviceType, implementations.toArray(new Object[implementations.size()]));
+                }
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not load aether resolver customizations", e);
         }
-        secDispatcher.setConfigurationFile( m_config.getSecuritySettings() );
-        decrypter.setSecurityDispatcher( secDispatcher );
-
-        locator.setServices( SettingsDecrypter.class, decrypter );
-
-
-
-        locator.setService( LocalRepositoryManagerFactory.class,
-            PaxLocalRepositoryManagerFactory.class );
-        locator.setService( org.eclipse.aether.spi.log.LoggerFactory.class,
-            Slf4jLoggerFactory.class );
 
         return locator.getService( RepositorySystem.class );
     }
+
+    private static Class load(ClassLoader classLoader, String type) {
+        try {
+            return classLoader.loadClass(type);
+        } catch (ClassNotFoundException e) {
+            // can happen, we are just overloading resources
+        }
+        return null;
+    }
+
 }
